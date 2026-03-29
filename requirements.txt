@@ -1,3 +1,5 @@
-playwright>=1.43
-python-telegram-bot>=21.0
-aiosqlite>=0.20
+﻿python-telegram-bot==21.5
+requests==2.32.3
+beautifulsoup4==4.12.3
+apscheduler==3.10.4
+lxml==5.3.0
