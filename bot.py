@@ -1,356 +1,121 @@
-"""
-bot.py — Entry point del bot de Telegram.
-
-Comandos:
-  /start          — bienvenida y ayuda
-  /agregar <url> [nombre] [umbral%]  — agrega un producto a monitorear
-  /lista          — muestra todos los watches del usuario
-  /ver <id>       — chequea precio ahora mismo
-  /historial <id> — últimos 10 precios registrados
-  /borrar <id>    — elimina un watch
-  /ayuda          — resumen de comandos
-"""
-
-import os
-import logging
-import asyncio
-from typing import Optional
-
+﻿import os, logging, asyncio, re
+import requests
+from bs4 import BeautifulSoup
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-)
-from telegram.constants import ParseMode
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+from db import DB
 
-import db
-from db import Watch
-from scraper import PriceScraper
-from monitor import PriceMonitor, _formatear_precio
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
-
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+CHECK_EVERY = int(os.getenv("CHECK_INTERVAL_MINUTES", "60"))
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
+def scrape_producto(url):
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+    except Exception as e:
+        logger.warning(f"Error: {e}")
+        return None
+    soup = BeautifulSoup(resp.text, "html.parser")
+    nombre_el = soup.select_one("h1")
+    nombre = nombre_el.get_text(strip=True) if nombre_el else url
+    precio_el = soup.select_one("span[class*='price'], p[class*='price'], div[class*='price']")
+    precio_texto = precio_el.get_text(strip=True) if precio_el else ""
+    precio = int(re.sub(r"[^\d]", "", precio_texto)) if "$" in precio_texto and re.sub(r"[^\d]", "", precio_texto) else None
+    sin_stock = any(x in resp.text.lower() for x in ["sin stock", "agotado", "out of stock"])
+    return {"nombre": nombre[:200], "precio": precio, "stock": not sin_stock}
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+async def revisar_todos(app):
+    db = app.bot_data["db"]
+    for prod in db.listar_todos():
+        await asyncio.sleep(2)
+        r = scrape_producto(prod["url"])
+        if not r: continue
+        alertas = []
+        if r["precio"] and prod["ultimo_precio"] and r["precio"] < prod["ultimo_precio"]:
+            pct = round((prod["ultimo_precio"] - r["precio"]) / prod["ultimo_precio"] * 100, 1)
+            alertas.append(f"📉 *Bajó el precio* ({pct}%)\nAntes: ${prod['ultimo_precio']:,} → Ahora: *${r['precio']:,}*")
+        if r["stock"] and not prod["ultimo_stock"]:
+            alertas.append("✅ *¡Volvió el stock!*")
+        if alertas:
+            try:
+                await app.bot.send_message(chat_id=prod["chat_id"], text=f"🔔 *Alerta*\n\n📦 {r['nombre']}\n🔗 {prod['url']}\n\n" + "\n".join(alertas), parse_mode="Markdown", disable_web_page_preview=True)
+            except Exception as e:
+                logger.error(e)
+        db.actualizar_precio(prod["id"], r["precio"], r["stock"])
 
-def _watch_resumen(w: Watch) -> str:
-    precio = _formatear_precio(w.precio_ultimo)
-    umbral = f"{w.umbral_pct:.0f}%" if w.umbral_pct > 0 else "cualquier bajada"
-    stock  = "✅" if w.precio_ultimo is not None else "❓"
-    return (
-        f"{stock} *[{w.id}] {w.nombre}*\n"
-        f"    Precio actual: `{precio}`\n"
-        f"    Umbral alerta: {umbral}\n"
-        f"    🔗 [Link]({w.url})"
-    )
+AYUDA = "🤖 *Price Monitor Bot*\n\n• `/agregar <url>` — monitorear producto\n• `/lista` — ver productos\n• `/verificar <url>` — precio ahora\n• `/eliminar` — eliminar producto"
 
+async def cmd_start(u, c): await u.message.reply_text(AYUDA, parse_mode="Markdown")
+async def cmd_ayuda(u, c): await u.message.reply_text(AYUDA, parse_mode="Markdown")
 
-def _parse_args(text: Optional[str]) -> list[str]:
-    return (text or "").split() if text else []
-
-
-# ---------------------------------------------------------------------------
-# Comandos
-# ---------------------------------------------------------------------------
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "👋 *Bot de monitoreo de precios*\n\n"
-        "Te aviso cuando baje el precio o vuelva a haber stock "
-        "en Falabella, Paris, Samsung, Cruz Verde y más.\n\n"
-        "Usa /ayuda para ver los comandos disponibles.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-async def cmd_ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "📋 *Comandos disponibles*\n\n"
-        "`/agregar <url>` — agrega producto a monitorear\n"
-        "`/agregar <url> nombre` — con nombre personalizado\n"
-        "`/agregar <url> nombre 10` — alerta solo si baja ≥10%\n\n"
-        "`/lista` — ver todos tus productos\n"
-        "`/ver <id>` — consultar precio ahora\n"
-        "`/historial <id>` — últimos 10 precios\n"
-        "`/borrar <id>` — dejar de monitorear\n",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-async def cmd_agregar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    args = _parse_args(context.args[0] if context.args else None)
-    # Reconstruir: los args ya vienen separados por telegram.ext
-    partes = context.args or []
-
-    if not partes:
-        await update.message.reply_text(
-            "⚠️ Uso: `/agregar <url> [nombre] [umbral%]`\n"
-            "Ejemplo: `/agregar https://falabella.com/... Samsung TV 10`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    url = partes[0]
-    if not url.startswith("http"):
-        await update.message.reply_text("❌ La URL debe comenzar con http.")
-        return
-
-    nombre   = " ".join(partes[1:-1]) if len(partes) > 2 else (partes[1] if len(partes) == 2 else url[:40])
-    umbral   = 0.0
-    if len(partes) >= 2:
-        try:
-            umbral = float(partes[-1])
-            if len(partes) == 2:
-                # El segundo argumento era el umbral, no el nombre
-                nombre = url[:40]
-        except ValueError:
-            if len(partes) >= 2:
-                nombre = " ".join(partes[1:])
-
+async def cmd_agregar(update, context):
+    if not context.args: await update.message.reply_text("Uso: `/agregar <url>`", parse_mode="Markdown"); return
+    url = context.args[0].strip()
+    if not url.startswith("http"): await update.message.reply_text("❌ URL inválida."); return
+    db = context.bot_data["db"]
     chat_id = update.effective_chat.id
-    msg = await update.message.reply_text("🔎 Verificando producto…")
+    msg = await update.message.reply_text("🔎 Verificando…")
+    r = scrape_producto(url)
+    if not r: await msg.edit_text("❌ No pude acceder a esa URL."); return
+    db.agregar(chat_id=chat_id, url=url, nombre=r["nombre"], precio=r["precio"], stock=r["stock"])
+    precio_str = f"${r['precio']:,}" if r["precio"] else "No detectado"
+    await msg.edit_text(f"✅ *Agregado*\n\n📦 {r['nombre']}\n💰 {precio_str}\n📊 {'✅ En stock' if r['stock'] else '❌ Sin stock'}", parse_mode="Markdown")
 
-    # Chequeo inicial inmediato
-    monitor: PriceMonitor = context.bot_data["monitor"]
-    watch_id = await db.add_watch(chat_id, url, nombre or url[:40], umbral)
-    watches = await db.get_watches(chat_id)
-    watch = next((w for w in watches if w.id == watch_id), None)
+async def cmd_verificar(update, context):
+    if not context.args: await update.message.reply_text("Uso: `/verificar <url>`", parse_mode="Markdown"); return
+    msg = await update.message.reply_text("🔎 Verificando…")
+    r = scrape_producto(context.args[0].strip())
+    if not r: await msg.edit_text("❌ No pude acceder."); return
+    await msg.edit_text(f"📦 *{r['nombre']}*\n💰 {'$'+str(f\"{r['precio']:,}\") if r['precio'] else 'No detectado'}\n📊 {'✅ En stock' if r['stock'] else '❌ Sin stock'}", parse_mode="Markdown")
 
-    if watch:
-        result = await monitor.chequear_ahora(watch)
-        precio_str = _formatear_precio(result.precio)
-        stock_str  = "✅ En stock" if result.en_stock else "❌ Sin stock"
-        umbral_str = f"≥ {umbral:.0f}%" if umbral > 0 else "cualquier bajada"
-        await msg.edit_text(
-            f"✅ *Agregado correctamente*\n\n"
-            f"📦 *{nombre}*\n"
-            f"💰 Precio inicial: `{precio_str}`\n"
-            f"📊 Stock: {stock_str}\n"
-            f"🔔 Alerta si baja: {umbral_str}\n\n"
-            f"ID del watch: `{watch_id}` — úsalo con /ver o /borrar",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    else:
-        await msg.edit_text("❌ Error al agregar el producto. Intenta de nuevo.")
+async def cmd_lista(update, context):
+    db = context.bot_data["db"]
+    prods = db.listar_por_chat(update.effective_chat.id)
+    if not prods: await update.message.reply_text("Sin productos. Usa `/agregar <url>`", parse_mode="Markdown"); return
+    lineas = [f"📋 *{len(prods)} productos:*\n"]
+    for p in prods:
+        lineas.append(f"• {'✅' if p['ultimo_stock'] else '❌'} *{p['nombre'][:50]}*\n  💰 {'$'+str(f\"{p['ultimo_precio']:,}\") if p['ultimo_precio'] else '—'}")
+    await update.message.reply_text("\n".join(lineas), parse_mode="Markdown")
 
+async def cmd_eliminar(update, context):
+    db = context.bot_data["db"]
+    prods = db.listar_por_chat(update.effective_chat.id)
+    if not prods: await update.message.reply_text("Sin productos."); return
+    await update.message.reply_text("¿Cuál eliminar?", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"🗑 {p['nombre'][:40]}", callback_data=f"del:{p['id']}")] for p in prods]))
 
-async def cmd_lista(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    watches = await db.get_watches(chat_id)
-
-    if not watches:
-        await update.message.reply_text(
-            "📭 No tienes productos monitoreados.\n"
-            "Usa /agregar <url> para comenzar.",
-        )
-        return
-
-    lines = [f"📋 *Tus {len(watches)} producto(s):*\n"]
-    for w in watches:
-        lines.append(_watch_resumen(w))
-
-    await update.message.reply_text(
-        "\n\n".join(lines),
-        parse_mode=ParseMode.MARKDOWN,
-        disable_web_page_preview=True,
-    )
-
-
-async def cmd_ver(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    partes = context.args or []
-    if not partes or not partes[0].isdigit():
-        await update.message.reply_text("Uso: `/ver <id>`", parse_mode=ParseMode.MARKDOWN)
-        return
-
-    watch_id = int(partes[0])
-    chat_id  = update.effective_chat.id
-    watches  = await db.get_watches(chat_id)
-    watch    = next((w for w in watches if w.id == watch_id), None)
-
-    if not watch:
-        await update.message.reply_text("❌ ID no encontrado o no es tuyo.")
-        return
-
-    msg = await update.message.reply_text(f"🔎 Consultando precio de *{watch.nombre}*…", parse_mode=ParseMode.MARKDOWN)
-    monitor: PriceMonitor = context.bot_data["monitor"]
-    result = await monitor.chequear_ahora(watch)
-
-    precio_str = _formatear_precio(result.precio)
-    stock_str  = "✅ En stock" if result.en_stock else "❌ Sin stock"
-
-    # Comparar con precio anterior
-    comparacion = ""
-    if watch.precio_ultimo and result.precio:
-        diff = watch.precio_ultimo - result.precio
-        if diff > 0:
-            comparacion = f"\n📉 Bajó {_formatear_precio(diff)} respecto al último registro"
-        elif diff < 0:
-            comparacion = f"\n📈 Subió {_formatear_precio(-diff)} respecto al último registro"
-        else:
-            comparacion = "\n➡️ Sin cambios"
-
-    await msg.edit_text(
-        f"📦 *{watch.nombre}*\n"
-        f"💰 Precio: `{precio_str}`\n"
-        f"📊 {stock_str}"
-        f"{comparacion}\n\n"
-        f"🔗 [Ver en tienda]({watch.url})",
-        parse_mode=ParseMode.MARKDOWN,
-        disable_web_page_preview=False,
-    )
-
-
-async def cmd_historial(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    partes = context.args or []
-    if not partes or not partes[0].isdigit():
-        await update.message.reply_text("Uso: `/historial <id>`", parse_mode=ParseMode.MARKDOWN)
-        return
-
-    watch_id = int(partes[0])
-    chat_id  = update.effective_chat.id
-    watches  = await db.get_watches(chat_id)
-    watch    = next((w for w in watches if w.id == watch_id), None)
-
-    if not watch:
-        await update.message.reply_text("❌ ID no encontrado o no es tuyo.")
-        return
-
-    records = await db.get_history(watch_id, limit=10)
-    if not records:
-        await update.message.reply_text("📭 Sin historial aún.")
-        return
-
-    lines = [f"📊 *Historial: {watch.nombre}*\n"]
-    for r in records:
-        stock_icon = "✅" if r.en_stock else "❌"
-        precio_str = _formatear_precio(r.precio)
-        # Mostrar solo fecha y hora sin segundos
-        ts = r.timestamp[:16].replace("T", " ")
-        lines.append(f"`{ts}` — {precio_str} {stock_icon}")
-
-    await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-async def cmd_borrar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    partes = context.args or []
-    if not partes or not partes[0].isdigit():
-        await update.message.reply_text("Uso: `/borrar <id>`", parse_mode=ParseMode.MARKDOWN)
-        return
-
-    watch_id = int(partes[0])
-    chat_id  = update.effective_chat.id
-
-    # Pedir confirmación con inline keyboard
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Sí, borrar", callback_data=f"del:{watch_id}"),
-            InlineKeyboardButton("❌ Cancelar",   callback_data="del:cancel"),
-        ]
-    ])
-    await update.message.reply_text(
-        f"¿Seguro que quieres dejar de monitorear el watch `{watch_id}`?",
-        reply_markup=keyboard,
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-async def callback_borrar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def callback_eliminar(update, context):
     query = update.callback_query
     await query.answer()
+    context.bot_data["db"].eliminar(int(query.data.split(":")[1]), query.message.chat_id)
+    await query.edit_message_text("✅ Eliminado.")
 
-    data    = query.data
-    chat_id = update.effective_chat.id
+async def post_init(app):
+    app.bot_data["db"] = DB()
+    s = AsyncIOScheduler()
+    s.add_job(revisar_todos, "interval", minutes=CHECK_EVERY, args=[app], next_run_time=None)
+    s.start()
+    app.bot_data["scheduler"] = s
 
-    if data == "del:cancel":
-        await query.edit_message_text("❌ Cancelado.")
-        return
+async def post_shutdown(app):
+    s = app.bot_data.get("scheduler")
+    if s: s.shutdown(wait=False)
 
-    watch_id = int(data.split(":")[1])
-    ok = await db.delete_watch(watch_id, chat_id)
-    if ok:
-        await query.edit_message_text(f"🗑️ Watch `{watch_id}` eliminado.", parse_mode=ParseMode.MARKDOWN)
-    else:
-        await query.edit_message_text("❌ No se pudo eliminar (ID incorrecto o no es tuyo).")
-
-
-# ---------------------------------------------------------------------------
-# Lifecycle
-# ---------------------------------------------------------------------------
-
-async def post_init(app) -> None:
-    await db.init_db()
-
-    scraper = PriceScraper()
-    await scraper.start()
-
-    async def send_alert(chat_id: int, mensaje: str) -> None:
-        try:
-            await app.bot.send_message(
-                chat_id=chat_id,
-                text=mensaje,
-                parse_mode=ParseMode.MARKDOWN,
-                disable_web_page_preview=True,
-            )
-        except Exception as e:
-            logger.error("Error enviando alerta a %d: %s", chat_id, e)
-
-    monitor = PriceMonitor(scraper, on_alert=send_alert)
-    monitor.start()
-
-    app.bot_data["scraper"] = scraper
-    app.bot_data["monitor"] = monitor
-
-
-async def post_shutdown(app) -> None:
-    monitor: PriceMonitor = app.bot_data.get("monitor")
-    scraper: PriceScraper = app.bot_data.get("scraper")
-    if monitor:
-        monitor.stop()
-    if scraper:
-        await scraper.stop()
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def main() -> None:
-    if not BOT_TOKEN:
-        raise RuntimeError("Falta TELEGRAM_BOT_TOKEN en variables de entorno")
-
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
-    )
-
-    app.add_handler(CommandHandler("start",     cmd_start))
-    app.add_handler(CommandHandler("ayuda",     cmd_ayuda))
-    app.add_handler(CommandHandler("agregar",   cmd_agregar))
-    app.add_handler(CommandHandler("lista",     cmd_lista))
-    app.add_handler(CommandHandler("ver",       cmd_ver))
-    app.add_handler(CommandHandler("historial", cmd_historial))
-    app.add_handler(CommandHandler("borrar",    cmd_borrar))
-    app.add_handler(CallbackQueryHandler(callback_borrar, pattern=r"^del:"))
-
+def main():
+    if not BOT_TOKEN: raise RuntimeError("Falta TELEGRAM_BOT_TOKEN")
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("ayuda", cmd_ayuda))
+    app.add_handler(CommandHandler("agregar", cmd_agregar))
+    app.add_handler(CommandHandler("verificar", cmd_verificar))
+    app.add_handler(CommandHandler("lista", cmd_lista))
+    app.add_handler(CommandHandler("eliminar", cmd_eliminar))
+    app.add_handler(CallbackQueryHandler(callback_eliminar, pattern=r"^del:"))
     logger.info("Bot corriendo…")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
