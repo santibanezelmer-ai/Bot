@@ -128,7 +128,7 @@ async def post_shutdown(app):
     if s:
         s.shutdown(wait=False)
 
-async def main():
+def main():
     if not BOT_TOKEN:
         raise RuntimeError("Falta TELEGRAM_BOT_TOKEN")
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
@@ -140,7 +140,7 @@ async def main():
     app.add_handler(CommandHandler("eliminar", cmd_eliminar))
     app.add_handler(CallbackQueryHandler(callback_eliminar, pattern=r"^del:"))
     logger.info("Bot corriendo...")
-    await app.run_polling()
+    app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
