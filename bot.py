@@ -17,7 +17,7 @@ def scrape_producto(url):
         resp = requests.get(url, headers=HEADERS, timeout=20)
         resp.raise_for_status()
     except Exception as e:
-        logger.warning(f"Error: {e}")
+        logger.warning("Error: " + str(e))
         return None
     soup = BeautifulSoup(resp.text, "html.parser")
     nombre_el = soup.select_one("h1")
@@ -51,11 +51,8 @@ async def revisar_todos(app):
 
 AYUDA = "Price Monitor Bot\n\n/agregar <url> - monitorear producto\n/lista - ver productos\n/verificar <url> - precio ahora\n/eliminar - eliminar producto"
 
-async def cmd_start(u, c):
-    await u.message.reply_text(AYUDA)
-
-async def cmd_ayuda(u, c):
-    await u.message.reply_text(AYUDA)
+async def cmd_start(u, c): await u.message.reply_text(AYUDA)
+async def cmd_ayuda(u, c): await u.message.reply_text(AYUDA)
 
 async def cmd_agregar(update, context):
     if not context.args:
@@ -131,7 +128,7 @@ async def post_shutdown(app):
     if s:
         s.shutdown(wait=False)
 
-def main():
+async def main():
     if not BOT_TOKEN:
         raise RuntimeError("Falta TELEGRAM_BOT_TOKEN")
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
@@ -143,7 +140,7 @@ def main():
     app.add_handler(CommandHandler("eliminar", cmd_eliminar))
     app.add_handler(CallbackQueryHandler(callback_eliminar, pattern=r"^del:"))
     logger.info("Bot corriendo...")
-    app.run_polling()
+    await app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
